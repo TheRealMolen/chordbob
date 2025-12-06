@@ -43,11 +43,9 @@ void initKeypad()
 	cfg.pin_config.sclk = seed::D8;
 	cfg.pin_config.miso = Pin();	// unused
 	cfg.pin_config.mosi = seed::D10;
-	cfg.pin_config.nss = Pin();//seed::D7;	// fingers crossed we can just use the HW for this - might need a pullup to 5V
+	cfg.pin_config.nss = Pin();
 
 	cfg.direction = SpiHandle::Config::Direction::TWO_LINES_TX_ONLY;	// it's a write-only device
-
-	//cfg.nss = SpiHandle::Config::NSS::HARD_OUTPUT;
 
 	rgb_spi_handle.Init(cfg);
 
@@ -94,21 +92,58 @@ void updateKeypadBlocking()
 //--------------------------------------------------------------------------------------------
 //--------------------------------------------------------------------------------------------
 
+Oscillator osc0;
+Oscillator osc1;
+Oscillator oscAmp;
+Oscillator oscAmp2;
+
+void audioInit()
+{
+	osc0.Init(48000);
+	osc0.SetWaveform(Oscillator::WAVE_TRI);
+	osc0.SetFreq(220);
+
+	osc1.Init(48000);
+	osc1.SetWaveform(Oscillator::WAVE_TRI);
+	osc1.SetFreq(330);
+
+	oscAmp.Init(48000);
+	oscAmp.SetWaveform(Oscillator::WAVE_RAMP);
+	oscAmp.SetFreq(1.5f);
+	oscAmp.SetAmp(-1.f);
+
+	oscAmp2.Init(48000);
+	oscAmp2.SetWaveform(Oscillator::WAVE_POLYBLEP_SAW);
+	oscAmp2.SetFreq(1.6f);
+	oscAmp2.SetAmp(1.f);
+}
+
 void audioTick(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size)
 {
 	for (size_t i = 0; i < size; i++)
 	{
-		out[0][i] = in[0][i];
-		out[1][i] = in[1][i];
+		float y0 = osc0.Process();
+		float y1 = osc1.Process();
+		float a = 0.5f * (1.f + oscAmp.Process());
+		float a2 = 0.5f * (1.f + oscAmp2.Process());
+
+		a *= a;
+		a2 *= a2;
+
+		out[0][i] = y0 * a;
+		out[1][i] = y1 * a2;
 	}
 }
 
+//--------------------------------------------------------------------------------------------
+//--------------------------------------------------------------------------------------------
+
 int main(void)
 {
-	hw.Configure();
 	hw.Init();
 
 	initKeypad();
+	audioInit();
 
 	hw.SetAudioBlockSize(4); // number of samples handled per callback
 	hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
@@ -118,14 +153,9 @@ int main(void)
 	for (;;)
 	{
 		hw.SetLed(true);
-		System::Delay(200);
+		System::Delay(300);
 		hw.SetLed(false);
-		System::Delay(200);
-
-		// hw.SetLed(true);
-		// System::Delay(600);
-		// hw.SetLed(false);
-		// System::Delay(200);
+		System::Delay(100);
 
 		for (u32 y=0; y<4; ++y)
 		{
