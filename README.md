@@ -16,6 +16,8 @@ daisy DGND (pin 40) -> keypad GND
 daisy D7 (pin 8) -> keypad GP17 (pin 22)    // RGB SPI chip select 
 daisy D8 (pin 9) -> keypad GP18 (pin 24)    // RGB SPI clk
 daisy D10 (pin 11) -> keypad GP19 (pin 25)  // RGB SPI mosi
+daisy D11 (pin 12) -> keypad GP5 (pin 7)    // keys I2C SCL
+daisy D12 (pin 13) -> keypad GP4 (pin 6)    // keys I2C SDA
 ```
 
 linux setup notes -- needed for vscode debugging on debian 13:

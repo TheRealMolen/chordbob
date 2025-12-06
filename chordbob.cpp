@@ -4,10 +4,16 @@
 using namespace daisy;
 using namespace daisysp;
 
+using u8 = uint8_t;
+using u16 = uint16_t;
 using u32 = uint32_t;
+
+constexpr float SampleRate = 48000;
+constexpr int SamplesPerBlock = 4;
 
 DaisySeed hw;
 
+I2CHandle key_i2c_handle;
 SpiHandle rgb_spi_handle;
 GPIO rgb_spi_cs;
 struct RgbSpiBuf
@@ -16,7 +22,7 @@ struct RgbSpiBuf
 	static constexpr uint32_t Height = 4;
 	static constexpr uint32_t NumLeds = Width * Height;
 	static constexpr uint32_t RgbiMask = 0x000000e0;	// all ibgr values must be ORd with this
-
+	static constexpr uint8_t BaseIntensity = 3;
 	uint32_t startFrame = 0;
 
 	uint32_t rgbi[NumLeds];
@@ -30,24 +36,33 @@ void updateKeypadBlocking();
 
 void initKeypad()
 {
-	// init our buffer
+	// init our keyboard input over I2C
+	I2CHandle::Config keyCfg;
+	keyCfg.periph = I2CHandle::Config::Peripheral::I2C_1;
+	keyCfg.speed  = I2CHandle::Config::Speed::I2C_400KHZ;
+	keyCfg.mode   = I2CHandle::Config::Mode::I2C_MASTER;
+	keyCfg.pin_config.scl  = seed::D11;
+	keyCfg.pin_config.sda  = seed::D12;
+	key_i2c_handle.Init(keyCfg);
+
+	// init our RGB buffer
 	for (uint32_t i=0; i < RgbSpiBuf::NumLeds; ++i)
-		rgb_spi_buf.rgbi[i] = (42 << 24) | (38 << 16) | (30 << 8) | RgbSpiBuf::RgbiMask | (11);
+		rgb_spi_buf.rgbi[i] = RgbSpiBuf::RgbiMask | RgbSpiBuf::BaseIntensity;
 
 	// init our SPI setup so we can set RGB values
-	SpiHandle::Config cfg;
+	SpiHandle::Config rgbCfg;
 
-	cfg.mode = SpiHandle::Config::Mode::MASTER;
-	cfg.periph = SpiHandle::Config::Peripheral::SPI_1;
+	rgbCfg.mode = SpiHandle::Config::Mode::MASTER;
+	rgbCfg.periph = SpiHandle::Config::Peripheral::SPI_1;
 
-	cfg.pin_config.sclk = seed::D8;
-	cfg.pin_config.miso = Pin();	// unused
-	cfg.pin_config.mosi = seed::D10;
-	cfg.pin_config.nss = Pin();
+	rgbCfg.pin_config.sclk = seed::D8;
+	rgbCfg.pin_config.miso = Pin();	// unused
+	rgbCfg.pin_config.mosi = seed::D10;
+	rgbCfg.pin_config.nss = Pin();
 
-	cfg.direction = SpiHandle::Config::Direction::TWO_LINES_TX_ONLY;	// it's a write-only device
+	rgbCfg.direction = SpiHandle::Config::Direction::TWO_LINES_TX_ONLY;	// it's a write-only device
 
-	rgb_spi_handle.Init(cfg);
+	rgb_spi_handle.Init(rgbCfg);
 
 	rgb_spi_cs.Init(seed::D7, GPIO::Mode::OUTPUT);
 	rgb_spi_cs.Write(true);
@@ -55,30 +70,28 @@ void initKeypad()
 	updateKeypadBlocking();
 }
 
-void setKeypadBrightness(uint32_t brightness)
-{
-	if (brightness >= 32)
-		return;
-
-	for (uint32_t i=0; i < RgbSpiBuf::NumLeds; ++i)
-	{
-		const uint32_t oldRgbi = rgb_spi_buf.rgbi[i];
-		const uint32_t oldRgbx = oldRgbi & 0xffffff00;
-		rgb_spi_buf.rgbi[i] = RgbSpiBuf::RgbiMask | (brightness) | oldRgbx;
-	}
-}
-
-void setKeypadPixel(uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b)
+void setKeypadPixelIntensity(uint32_t x, uint32_t y, uint32_t i)
 {
 	if (x >= RgbSpiBuf::Width || y >= RgbSpiBuf::Height)
 		return;
-	
-	uint32_t i = x + (y * RgbSpiBuf::Width);
+	if (i >= 31)
+		i = 31;
 
-	const uint32_t oldRgbi = rgb_spi_buf.rgbi[i];
-	const uint32_t oldI = oldRgbi & 0xff;
-	const uint32_t rgbx = (uint32_t(r) << 24) | (uint32_t(g) << 16) | (uint32_t(b) << 8);
-	rgb_spi_buf.rgbi[i] = oldI | rgbx;
+	uint32_t ix = x + (y * RgbSpiBuf::Width);
+	uint32_t oldRgbx = rgb_spi_buf.rgbi[ix] & (RgbSpiBuf::RgbiMask | 0xffffff00);
+	rgb_spi_buf.rgbi[ix] = oldRgbx | i;
+}
+
+void setKeypadPixel(uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b, uint8_t i = RgbSpiBuf::BaseIntensity)
+{
+	if (x >= RgbSpiBuf::Width || y >= RgbSpiBuf::Height)
+		return;
+	if (i >= 31)
+		i = 31;
+	
+	uint32_t ix = x + (y * RgbSpiBuf::Width);
+	const uint32_t rgbi = RgbSpiBuf::RgbiMask | (uint32_t(r) << 24) | (uint32_t(g) << 16) | (uint32_t(b) << 8) | i;
+	rgb_spi_buf.rgbi[ix] = rgbi;
 }
 
 
@@ -89,49 +102,134 @@ void updateKeypadBlocking()
 	rgb_spi_cs.Write(true);
 }
 
+uint16_t readKeypadButtonsDownBlocking()
+{
+	// uses a TCA9555 IO expander on address 0x20 - see https://www.ti.com/lit/ds/symlink/tca9555.pdf
+	constexpr uint16_t TCA9555_ADDR = 0x20;
+
+	uint8_t cmd = 0;	// "read input port 0"
+	key_i2c_handle.TransmitBlocking(TCA9555_ADDR, &cmd, 1, 1000);
+
+	uint8_t readBuf[2];
+	key_i2c_handle.ReceiveBlocking(TCA9555_ADDR, readBuf, sizeof(readBuf), 1000);
+
+	uint16_t down = ~(readBuf[0] | (readBuf[1] << 8));
+	return down;
+}
+
 //--------------------------------------------------------------------------------------------
 //--------------------------------------------------------------------------------------------
 
-Oscillator osc0;
-Oscillator osc1;
-Oscillator oscAmp;
-Oscillator oscAmp2;
+enum class Chord : u8
+{
+	Major,
+	Minor,
+	Maj7,
+	Min7,
+	Maj6,
+	Min6,
+	Dim,
+};
+
+namespace ctrl
+{
+	int newNoteMidi = 0;
+	bool requestNewRoot = false;
+	bool playChord = false;
+
+	Chord newChord = Chord::Major;
+	bool requestNewChord = false;
+}
+
+constexpr int NumOscs = 3;
+Oscillator oscBank[NumOscs];
+Adsr adsr0;
 
 void audioInit()
 {
-	osc0.Init(48000);
-	osc0.SetWaveform(Oscillator::WAVE_TRI);
-	osc0.SetFreq(220);
+	for (int i=0; i<NumOscs; ++i)
+	{
+		oscBank[i].Init(SampleRate);
+		oscBank[i].SetWaveform(Oscillator::WAVE_POLYBLEP_TRI);
+		oscBank[i].SetFreq(220);
+	}
 
-	osc1.Init(48000);
-	osc1.SetWaveform(Oscillator::WAVE_TRI);
-	osc1.SetFreq(330);
-
-	oscAmp.Init(48000);
-	oscAmp.SetWaveform(Oscillator::WAVE_RAMP);
-	oscAmp.SetFreq(1.5f);
-	oscAmp.SetAmp(-1.f);
-
-	oscAmp2.Init(48000);
-	oscAmp2.SetWaveform(Oscillator::WAVE_POLYBLEP_SAW);
-	oscAmp2.SetFreq(1.6f);
-	oscAmp2.SetAmp(1.f);
+	adsr0.Init(SampleRate, SamplesPerBlock);
+	adsr0.SetAttackTime(0.25f, 0.f);
+	adsr0.SetDecayTime(1.2f);
+	adsr0.SetSustainLevel(0.7f);
+	adsr0.SetReleaseTime(0.5f);
 }
 
 void audioTick(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size)
 {
+	// are we changing chord?
+	if (ctrl::requestNewRoot || ctrl::requestNewChord)
+	{
+		u8 newNote0 = ctrl::newNoteMidi;
+		u8 newNote1 = newNote0 + 7;
+		u8 newNote2 = newNote0 - 12;
+		switch (ctrl::newChord)
+		{
+			case Chord::Major:
+				newNote1 = newNote0 + 4;
+				newNote2 = newNote0 + 7;
+				break;
+
+			case Chord::Minor:
+				newNote1 = newNote0 + 3;
+				newNote2 = newNote0 + 7;
+				break;
+
+			case Chord::Maj7:
+				newNote1 = newNote0 + 7;
+				newNote2 = newNote0 + 11;
+				break;
+
+			case Chord::Min7:
+				newNote1 = newNote0 + 7;
+				newNote2 = newNote0 + 10;
+				break;
+
+			case Chord::Maj6:
+				newNote1 = newNote0 + 4;
+				newNote2 = newNote0 + 9;
+				break;
+
+			case Chord::Min6:
+				newNote1 = newNote0 + 4;
+				newNote2 = newNote0 + 8;
+				break;
+
+			case Chord::Dim:
+				newNote1 = newNote0 + 3;
+				newNote2 = newNote0 + 6;
+				break;
+		}
+
+		oscBank[0].SetFreq(mtof(newNote0));
+		oscBank[1].SetFreq(mtof(newNote1));
+		oscBank[2].SetFreq(mtof(newNote2));
+
+		ctrl::requestNewRoot = false;
+		ctrl::requestNewChord = false;
+	}
+
+	float env = adsr0.Process(ctrl::playChord);
+
 	for (size_t i = 0; i < size; i++)
 	{
-		float y0 = osc0.Process();
-		float y1 = osc1.Process();
-		float a = 0.5f * (1.f + oscAmp.Process());
-		float a2 = 0.5f * (1.f + oscAmp2.Process());
+		float o = 0.f;
+		for (int i=0; i<NumOscs; ++i)
+		{
+			o += oscBank[i].Process();
+		}
+		o *= (1.f / NumOscs);
 
-		a *= a;
-		a2 *= a2;
+		o *= env;
 
-		out[0][i] = y0 * a;
-		out[1][i] = y1 * a2;
+		out[0][i] = o;
+		out[1][i] = o;
 	}
 }
 
@@ -145,28 +243,95 @@ int main(void)
 	initKeypad();
 	audioInit();
 
-	hw.SetAudioBlockSize(4); // number of samples handled per callback
+	hw.SetAudioBlockSize(SamplesPerBlock); // number of samples handled per callback
 	hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
 	hw.StartAudio(audioTick);
 
-	int col = 0;
+	// set up our basic keyboard colours
+	// keys C -> B  (https://colordesigner.io/gradient-generator)
+	setKeypadPixel(3, 3, 255, 8, 8);
+	setKeypadPixel(2, 3, 255, 82, 0);
+	setKeypadPixel(3, 2, 255, 121, 0);
+	setKeypadPixel(2, 2, 255, 155, 0);
+	setKeypadPixel(3, 1, 255, 186, 0);
+	setKeypadPixel(2, 1, 255, 216, 0);
+	setKeypadPixel(3, 0, 254, 244, 0);
+	// sharp key
+	setKeypadPixel(2, 0, 0, 20, 130);
+	// min / 7 / 6
+	setKeypadPixel(0, 3, 0, 163, 254);
+	setKeypadPixel(0, 2, 196, 74, 255);
+	setKeypadPixel(0, 1, 15, 255, 197);
+	//setKeypadPixel(0, 3, 255, 239, 207);
+
+	u8 currNote = 0;
+	Chord currChord = Chord::Major;
+
 	for (;;)
 	{
-		hw.SetLed(true);
-		System::Delay(300);
-		hw.SetLed(false);
-		System::Delay(100);
+		u16 keysDown = readKeypadButtonsDownBlocking();
 
+		if (keysDown & 0xccc8)
+		{
+			u8 oldNote = currNote;
+
+			if (keysDown & 0x8000)
+				currNote = 48;	// C
+			else if (keysDown & 0x4000)
+				currNote = 50;	// D
+			else if (keysDown & 0x0800)
+				currNote = 52;	// E
+			else if (keysDown & 0x0400)
+				currNote = 53;	// F
+			else if (keysDown & 0x0080)
+				currNote = 55;	// G
+			else if (keysDown & 0x0040)
+				currNote = 57;	// A
+			else if (keysDown & 0x0008)
+				currNote = 59;	// B
+
+			if (keysDown & 0x0004)
+				currNote++;
+
+			if (oldNote != currNote)
+			{
+				ctrl::newNoteMidi = currNote;
+				ctrl::requestNewRoot = true;
+			}
+			ctrl::playChord = true;
+		}
+		else
+		{
+			ctrl::playChord = false;
+		}
+
+		Chord oldChord = currChord;
+		switch (keysDown & 0x1110)
+		{
+			case 0: 		currChord = Chord::Major;	break;
+			case 0x1000: 	currChord = Chord::Minor;	break;
+			case 0x0100: 	currChord = Chord::Maj7;	break;
+			case 0x1100: 	currChord = Chord::Min7;	break;
+			case 0x0010: 	currChord = Chord::Maj6;	break;
+			case 0x1010: 	currChord = Chord::Min6;	break;
+			case 0x0110: 	currChord = Chord::Dim;		break;
+			default:		currChord = oldChord;		break;
+		}
+		if (oldChord != currChord)
+		{
+			ctrl::newChord = currChord;
+			ctrl::requestNewChord = true;
+		}
+
+		int mask = 1;
 		for (u32 y=0; y<4; ++y)
 		{
-			for (u32 x=0; x<4; ++x)
+			for (u32 x=0; x<4; ++x, mask <<= 1)
 			{
-				bool shinyG = ((x+y) & 3) == (col & 3);
-				bool shinyR = ((x-y) & 3) == (col & 3);
-				setKeypadPixel(x, y, shinyR?0xff:0x40, shinyG?0xff:0x40, 0x38);
+				bool down = (keysDown & mask) != 0;
+				setKeypadPixelIntensity(x, y, down ? 11 : RgbSpiBuf::BaseIntensity);
 			}
 		}
-		++col;
 
 		updateKeypadBlocking();
 	}
