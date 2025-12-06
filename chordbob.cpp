@@ -164,7 +164,7 @@ void audioInit()
 void audioTick(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size)
 {
 	// are we changing chord?
-	if (ctrl::requestNewRoot || ctrl::requestNewChord)
+	if (ctrl::requestNewRoot /*|| ctrl::requestNewChord*/)
 	{
 		u8 newNote0 = ctrl::newNoteMidi;
 		u8 newNote1 = newNote0 + 7;
@@ -250,12 +250,12 @@ int main(void)
 	// set up our basic keyboard colours
 	// keys C -> B  (https://colordesigner.io/gradient-generator)
 	setKeypadPixel(3, 3, 255, 8, 8);
-	setKeypadPixel(2, 3, 255, 82, 0);
-	setKeypadPixel(3, 2, 255, 121, 0);
-	setKeypadPixel(2, 2, 255, 155, 0);
-	setKeypadPixel(3, 1, 255, 186, 0);
-	setKeypadPixel(2, 1, 255, 216, 0);
-	setKeypadPixel(3, 0, 254, 244, 0);
+	setKeypadPixel(2, 3, 255, 32, 0);
+	setKeypadPixel(3, 2, 255, 61, 0);
+	setKeypadPixel(2, 2, 255, 95, 0);
+	setKeypadPixel(3, 1, 255, 136, 0);
+	setKeypadPixel(2, 1, 255, 186, 0);
+	setKeypadPixel(3, 0, 244, 224, 0);
 	// sharp key
 	setKeypadPixel(2, 0, 0, 20, 130);
 	// min / 7 / 6
@@ -264,14 +264,17 @@ int main(void)
 	setKeypadPixel(0, 1, 15, 255, 197);
 	//setKeypadPixel(0, 3, 255, 239, 207);
 
+	u16 oldKeysDown = 0;
 	u8 currNote = 0;
 	Chord currChord = Chord::Major;
 
 	for (;;)
 	{
 		u16 keysDown = readKeypadButtonsDownBlocking();
+		u16 keysChanged = keysDown ^ oldKeysDown;
 
-		if (keysDown & 0xccc8)
+		bool sharp = keysDown & 0x0004;
+		if (keysChanged & 0xccc8)
 		{
 			u8 oldNote = currNote;
 
@@ -290,7 +293,7 @@ int main(void)
 			else if (keysDown & 0x0008)
 				currNote = 59;	// B
 
-			if (keysDown & 0x0004)
+			if (sharp)
 				currNote++;
 
 			if (oldNote != currNote)
@@ -298,10 +301,14 @@ int main(void)
 				ctrl::newNoteMidi = currNote;
 				ctrl::requestNewRoot = true;
 			}
+		}
+		if (keysDown & 0xccc8)
+		{
 			ctrl::playChord = true;
 		}
 		else
 		{
+			currNote = 0;
 			ctrl::playChord = false;
 		}
 
@@ -332,6 +339,8 @@ int main(void)
 				setKeypadPixelIntensity(x, y, down ? 11 : RgbSpiBuf::BaseIntensity);
 			}
 		}
+
+		oldKeysDown = keysDown;
 
 		updateKeypadBlocking();
 	}
