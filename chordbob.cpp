@@ -1,5 +1,6 @@
 #include "daisy_seed.h"
 #include "daisysp.h"
+#include "Effects/reverbsc.h"
 
 using namespace daisy;
 using namespace daisysp;
@@ -143,7 +144,8 @@ namespace ctrl
 
 constexpr int NumOscs = 3;
 Oscillator oscBank[NumOscs];
-Adsr adsr0;
+Adsr adsrBank[NumOscs];
+ReverbSc reverb;
 
 void audioInit()
 {
@@ -152,13 +154,17 @@ void audioInit()
 		oscBank[i].Init(SampleRate);
 		oscBank[i].SetWaveform(Oscillator::WAVE_POLYBLEP_TRI);
 		oscBank[i].SetFreq(220);
+
+		adsrBank[i].Init(SampleRate, SamplesPerBlock);
+		adsrBank[i].SetAttackTime(0.25f + i*0.2f, 0.f);
+		adsrBank[i].SetDecayTime(1.2f);
+		adsrBank[i].SetSustainLevel(0.7f - i*0.05f);
+		adsrBank[i].SetReleaseTime(0.4f);
 	}
 
-	adsr0.Init(SampleRate, SamplesPerBlock);
-	adsr0.SetAttackTime(0.25f, 0.f);
-	adsr0.SetDecayTime(1.2f);
-	adsr0.SetSustainLevel(0.7f);
-	adsr0.SetReleaseTime(0.5f);
+	reverb.Init(SampleRate);
+	reverb.SetFeedback(0.8f);
+	reverb.SetLpFreq(1200.f);
 }
 
 void audioTick(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size)
@@ -215,7 +221,11 @@ void audioTick(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_
 		ctrl::requestNewChord = false;
 	}
 
-	float env = adsr0.Process(ctrl::playChord);
+	float env[NumOscs];
+	for (int i=0; i<NumOscs; ++i)
+	{
+		env[i] = adsrBank[i].Process(ctrl::playChord);
+	}
 
 	for (size_t i = 0; i < size; i++)
 	{
@@ -223,13 +233,15 @@ void audioTick(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_
 		for (int i=0; i<NumOscs; ++i)
 		{
 			o += oscBank[i].Process();
+			o *= env[i];
 		}
 		o *= (1.f / NumOscs);
 
-		o *= env;
+		float rl, rr;
+		reverb.Process(o, o, &rl, &rr);
 
-		out[0][i] = o;
-		out[1][i] = o;
+		out[0][i] = 0.6f * o + 0.4f * rl;
+		out[1][i] = 0.6f * o + 0.4f * rr;
 	}
 }
 
@@ -248,7 +260,7 @@ int main(void)
 	hw.StartAudio(audioTick);
 
 	// set up our basic keyboard colours
-	// keys C -> B  (https://colordesigner.io/gradient-generator)
+	// keys C -> B
 	setKeypadPixel(3, 3, 255, 8, 8);
 	setKeypadPixel(2, 3, 255, 32, 0);
 	setKeypadPixel(3, 2, 255, 61, 0);
@@ -273,7 +285,6 @@ int main(void)
 		u16 keysDown = readKeypadButtonsDownBlocking();
 		u16 keysChanged = keysDown ^ oldKeysDown;
 
-		bool sharp = keysDown & 0x0004;
 		if (keysChanged & 0xccc8)
 		{
 			u8 oldNote = currNote;
@@ -293,7 +304,7 @@ int main(void)
 			else if (keysDown & 0x0008)
 				currNote = 59;	// B
 
-			if (sharp)
+			if ((keysDown & 0x0004) && (keysDown & 0xccc8))
 				currNote++;
 
 			if (oldNote != currNote)
