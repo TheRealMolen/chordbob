@@ -1,21 +1,18 @@
-#include "daisy_seed.h"
-#include "daisysp.h"
+
+#include "mln_core.h"
+
+#include "filterstack.h"
 #include "Effects/reverbsc.h"
 
-using namespace daisy;
-using namespace daisysp;
-
-using u8 = uint8_t;
-using u16 = uint16_t;
-using u32 = uint32_t;
 
 constexpr float SampleRate = 48000;
 constexpr int SamplesPerBlock = 4;
 
-DaisySeed hw;
+using DaisyHw = daisy::DaisySeed;
+DaisyHw hw;
 
-I2CHandle key_i2c_handle;
-SpiHandle rgb_spi_handle;
+daisy::I2CHandle key_i2c_handle;
+daisy::SpiHandle rgb_spi_handle;
 GPIO rgb_spi_cs;
 struct RgbSpiBuf
 {
@@ -38,12 +35,13 @@ void updateKeypadBlocking();
 void initKeypad()
 {
 	// init our keyboard input over I2C
-	I2CHandle::Config keyCfg;
-	keyCfg.periph = I2CHandle::Config::Peripheral::I2C_1;
-	keyCfg.speed  = I2CHandle::Config::Speed::I2C_400KHZ;
-	keyCfg.mode   = I2CHandle::Config::Mode::I2C_MASTER;
-	keyCfg.pin_config.scl  = seed::D11;
-	keyCfg.pin_config.sda  = seed::D12;
+	using I2CConfig = daisy::I2CHandle::Config;
+	I2CConfig keyCfg;
+	keyCfg.periph = I2CConfig::Peripheral::I2C_1;
+	keyCfg.speed  = I2CConfig::Speed::I2C_400KHZ;
+	keyCfg.mode   = I2CConfig::Mode::I2C_MASTER;
+	keyCfg.pin_config.scl  = daisy::seed::D11;
+	keyCfg.pin_config.sda  = daisy::seed::D12;
 	key_i2c_handle.Init(keyCfg);
 
 	// init our RGB buffer
@@ -51,21 +49,22 @@ void initKeypad()
 		rgb_spi_buf.rgbi[i] = RgbSpiBuf::RgbiMask | RgbSpiBuf::BaseIntensity;
 
 	// init our SPI setup so we can set RGB values
-	SpiHandle::Config rgbCfg;
+	using SpiConfig = daisy::SpiHandle::Config;
+	SpiConfig rgbCfg;
 
-	rgbCfg.mode = SpiHandle::Config::Mode::MASTER;
-	rgbCfg.periph = SpiHandle::Config::Peripheral::SPI_1;
+	rgbCfg.mode = SpiConfig::Mode::MASTER;
+	rgbCfg.periph = SpiConfig::Peripheral::SPI_1;
 
-	rgbCfg.pin_config.sclk = seed::D8;
+	rgbCfg.pin_config.sclk = daisy::seed::D8;
 	rgbCfg.pin_config.miso = Pin();	// unused
-	rgbCfg.pin_config.mosi = seed::D10;
+	rgbCfg.pin_config.mosi = daisy::seed::D10;
 	rgbCfg.pin_config.nss = Pin();
 
-	rgbCfg.direction = SpiHandle::Config::Direction::TWO_LINES_TX_ONLY;	// it's a write-only device
+	rgbCfg.direction = SpiConfig::Direction::TWO_LINES_TX_ONLY;	// it's a write-only device
 
 	rgb_spi_handle.Init(rgbCfg);
 
-	rgb_spi_cs.Init(seed::D7, GPIO::Mode::OUTPUT);
+	rgb_spi_cs.Init(daisy::seed::D7, GPIO::Mode::OUTPUT);
 	rgb_spi_cs.Write(true);
 
 	updateKeypadBlocking();
@@ -126,9 +125,11 @@ enum class Chord : u8
 	Major,
 	Minor,
 	Maj7,
-	Min7,
+	m7,
+	Dom7,
 	Maj6,
-	Min6,
+	Sus2,
+	Sus4,
 	Dim,
 };
 
@@ -136,86 +137,121 @@ namespace ctrl
 {
 	int newNoteMidi = 0;
 	bool requestNewRoot = false;
-	bool playChord = false;
+	bool gate = false;
 
 	Chord newChord = Chord::Major;
 	bool requestNewChord = false;
 }
 
-constexpr int NumOscs = 3;
-Oscillator oscBank[NumOscs];
-Adsr adsrBank[NumOscs];
-ReverbSc reverb;
+constexpr int NumOscs = 4;
+daisysp::Oscillator oscBank[NumOscs];
+daisysp::Adsr adsrBank[NumOscs];
+mln::FilterStack<2, mln::FilterType::LoPass> outFilter;
+daisysp::ReverbSc reverb;
 
 void audioInit()
 {
 	for (int i=0; i<NumOscs; ++i)
 	{
 		oscBank[i].Init(SampleRate);
-		oscBank[i].SetWaveform(Oscillator::WAVE_POLYBLEP_TRI);
+		oscBank[i].SetWaveform(daisysp::Oscillator::WAVE_POLYBLEP_TRI);
 		oscBank[i].SetFreq(220);
+		oscBank[i].SetAmp(0.5f - (0.01f * i * i));
 
 		adsrBank[i].Init(SampleRate, SamplesPerBlock);
 		adsrBank[i].SetAttackTime(0.25f + i*0.2f, 0.f);
-		adsrBank[i].SetDecayTime(1.2f);
-		adsrBank[i].SetSustainLevel(0.7f - i*0.05f);
-		adsrBank[i].SetReleaseTime(0.4f);
+		adsrBank[i].SetDecayTime(0.2f);
+		adsrBank[i].SetSustainLevel(0.95f - i*0.05f);
+		adsrBank[i].SetReleaseTime(0.3f);
 	}
 
 	reverb.Init(SampleRate);
-	reverb.SetFeedback(0.8f);
+	reverb.SetFeedback(0.5f);
 	reverb.SetLpFreq(1200.f);
+
+	outFilter.Init(SampleRate);
 }
 
-void audioTick(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size)
+void audioTick(daisy::AudioHandle::InputBuffer in, daisy::AudioHandle::OutputBuffer out, size_t numSamples)
 {
 	// are we changing chord?
-	if (ctrl::requestNewRoot /*|| ctrl::requestNewChord*/)
+	if (ctrl::requestNewRoot)
 	{
-		u8 newNote0 = ctrl::newNoteMidi;
-		u8 newNote1 = newNote0 + 7;
-		u8 newNote2 = newNote0 - 12;
+		float newNote0 = ctrl::newNoteMidi;
+		float newNote1 = newNote0;
+		float newNote2 = newNote0;
+		float newNote3 = newNote0;
+
+		constexpr float detune = 0.05f;
+
 		switch (ctrl::newChord)
 		{
 			case Chord::Major:
 				newNote1 = newNote0 + 4;
 				newNote2 = newNote0 + 7;
+				newNote3 = newNote0 + detune;
+				newNote0 -= detune;
 				break;
 
 			case Chord::Minor:
 				newNote1 = newNote0 + 3;
 				newNote2 = newNote0 + 7;
+				newNote3 = newNote0 + detune;
+				newNote0 -= detune;
 				break;
 
 			case Chord::Maj7:
-				newNote1 = newNote0 + 7;
-				newNote2 = newNote0 + 11;
+				newNote1 = newNote0 + 4;
+				newNote2 = newNote0 + 7;
+				newNote3 = newNote0 + 11;
 				break;
 
-			case Chord::Min7:
-				newNote1 = newNote0 + 7;
-				newNote2 = newNote0 + 10;
+			case Chord::Dom7:
+				newNote1 = newNote0 + 4;
+				newNote2 = newNote0 + 7;
+				newNote3 = newNote0 + 10;
+				break;
+
+			case Chord::m7:
+				newNote1 = newNote0 + 3;
+				newNote2 = newNote0 + 7;
+				newNote3 = newNote0 + 10;
 				break;
 
 			case Chord::Maj6:
 				newNote1 = newNote0 + 4;
-				newNote2 = newNote0 + 9;
-				break;
-
-			case Chord::Min6:
-				newNote1 = newNote0 + 4;
-				newNote2 = newNote0 + 8;
+				newNote2 = newNote0 + 7;
+				newNote3 = newNote0 + 9;
 				break;
 
 			case Chord::Dim:
 				newNote1 = newNote0 + 3;
 				newNote2 = newNote0 + 6;
+				newNote3 = newNote0 + detune;
+				newNote0 -= detune;
+				break;
+
+			case Chord::Sus2:
+				newNote1 = newNote0 + 2;
+				newNote2 = newNote0 + 7;
+				newNote3 = newNote0 + detune;
+				newNote0 -= detune;
+				break;
+
+			case Chord::Sus4:
+				newNote1 = newNote0 + 5;
+				newNote2 = newNote0 + 7;
+				newNote3 = newNote0 + detune;
+				newNote0 -= detune;
 				break;
 		}
 
-		oscBank[0].SetFreq(mtof(newNote0));
-		oscBank[1].SetFreq(mtof(newNote1));
-		oscBank[2].SetFreq(mtof(newNote2));
+		oscBank[0].SetFreq(daisysp::mtof(newNote0));
+		oscBank[1].SetFreq(daisysp::mtof(newNote1));
+		oscBank[2].SetFreq(daisysp::mtof(newNote2));
+		oscBank[3].SetFreq(daisysp::mtof(newNote3));
+
+		outFilter.SetFreq(daisysp::mtof(newNote0 + 24));
 
 		ctrl::requestNewRoot = false;
 		ctrl::requestNewChord = false;
@@ -224,24 +260,28 @@ void audioTick(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_
 	float env[NumOscs];
 	for (int i=0; i<NumOscs; ++i)
 	{
-		env[i] = adsrBank[i].Process(ctrl::playChord);
+		env[i] = adsrBank[i].Process(ctrl::gate);
 	}
 
-	for (size_t i = 0; i < size; i++)
+	for (size_t ixSample = 0; ixSample < numSamples; ixSample++)
 	{
 		float o = 0.f;
-		for (int i=0; i<NumOscs; ++i)
+		for (int ixOsc=0; ixOsc<NumOscs; ++ixOsc)
 		{
-			o += oscBank[i].Process();
-			o *= env[i];
+			o += oscBank[ixOsc].Process();
+			o *= env[ixOsc];
 		}
 		o *= (1.f / NumOscs);
 
-		float rl, rr;
-		reverb.Process(o, o, &rl, &rr);
+		o *= 0.5f;
+	//	o = outFilter.Process(o);
 
-		out[0][i] = 0.6f * o + 0.4f * rl;
-		out[1][i] = 0.6f * o + 0.4f * rr;
+		float rl, rr;
+		//reverb.Process(o, o, &rl, &rr);
+		rl = rr = o;
+
+		out[0][ixSample] = 0.6f * o + 0.4f * rl;
+		out[1][ixSample] = 0.6f * o + 0.4f * rr;
 	}
 }
 
@@ -256,7 +296,7 @@ int main(void)
 	audioInit();
 
 	hw.SetAudioBlockSize(SamplesPerBlock); // number of samples handled per callback
-	hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
+	hw.SetAudioSampleRate(daisy::SaiHandle::Config::SampleRate::SAI_48KHZ);
 	hw.StartAudio(audioTick);
 
 	// set up our basic keyboard colours
@@ -272,9 +312,9 @@ int main(void)
 	setKeypadPixel(2, 0, 0, 20, 130);
 	// min / 7 / 6
 	setKeypadPixel(0, 3, 0, 163, 254);
-	setKeypadPixel(0, 2, 196, 74, 255);
+	setKeypadPixel(0, 2, 196, 124, 25);
 	setKeypadPixel(0, 1, 15, 255, 197);
-	//setKeypadPixel(0, 3, 255, 239, 207);
+	setKeypadPixel(0, 0, 205, 199, 157);
 
 	u16 oldKeysDown = 0;
 	u8 currNote = 0;
@@ -315,24 +355,27 @@ int main(void)
 		}
 		if (keysDown & 0xccc8)
 		{
-			ctrl::playChord = true;
+			ctrl::gate = true;
 		}
 		else
 		{
 			currNote = 0;
-			ctrl::playChord = false;
+			ctrl::gate = false;
 		}
 
 		Chord oldChord = currChord;
-		switch (keysDown & 0x1110)
+		switch (keysDown & 0x1111)
 		{
-			case 0: 		currChord = Chord::Major;	break;
+			//   0 m76s
+			case 0x0000: 	currChord = Chord::Major;	break;
 			case 0x1000: 	currChord = Chord::Minor;	break;
-			case 0x0100: 	currChord = Chord::Maj7;	break;
-			case 0x1100: 	currChord = Chord::Min7;	break;
+			case 0x0100: 	currChord = Chord::Dom7;	break;
+			case 0x1100: 	currChord = Chord::m7;		break;
 			case 0x0010: 	currChord = Chord::Maj6;	break;
-			case 0x1010: 	currChord = Chord::Min6;	break;
+			case 0x1010: 	currChord = Chord::Maj7;	break;
 			case 0x0110: 	currChord = Chord::Dim;		break;
+			case 0x0001: 	currChord = Chord::Sus4;	break;
+			case 0x1001: 	currChord = Chord::Sus2;	break;
 			default:		currChord = oldChord;		break;
 		}
 		if (oldChord != currChord)
